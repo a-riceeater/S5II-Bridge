@@ -11,6 +11,7 @@ struct ContentView: View {
 
     @State private var showLogs = false
     @State private var showSettings = false
+    @State private var showExposure = false
     @Namespace private var glass
 
     var body: some View {
@@ -36,6 +37,12 @@ struct ContentView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
+                    Button { showExposure = true } label: {
+                        Label("Exposure", systemImage: "camera.aperture")
+                    }
+                    .disabled(!model.canRecord)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button { showLogs = true } label: {
                         Label("Developer log", systemImage: "terminal")
                     }
@@ -43,6 +50,7 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showLogs) { DevLogView() }
             .sheet(isPresented: $showSettings) { SettingsView() }
+            .sheet(isPresented: $showExposure) { CameraSettingsView() }
         }
         .onChange(of: scenePhase) { _, phase in
             model.handleScenePhase(phase)

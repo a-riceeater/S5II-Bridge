@@ -191,6 +191,79 @@ final class BridgeModel {
         }
     }
 
+    // MARK: - Exposure settings
+    //
+    // Loaded only when the settings sheet is opened or the user pulls to
+    // refresh. Never polled — the keepalive stays exactly one getstate every
+    // 3s so the shutter always has a live session.
+
+    private(set) var settings = ExposureSettings()
+    private(set) var isLoadingSettings = false
+    private(set) var settingsError: String?
+    private var menuOptions: MenuOptions?
+
+    var settingsAvailable: Bool {
+        canRecord && !isRecording && (state?.isInRecordMode ?? false)
+    }
+
+    var settingsUnavailableReason: String? {
+        if !canRecord { return "Not connected to a camera." }
+        if isRecording { return "Locked while recording." }
+        if let m = state?.camMode, m != "rec" { return "Camera is in \(m) mode." }
+        return nil
+    }
+
+    /// One batch of reads. Safe to call repeatedly; it is never automatic.
+    func loadSettings(refreshOptions: Bool = false) {
+        guard !isLoadingSettings else { return }
+        isLoadingSettings = true
+        settingsError = nil
+        Task {
+            do {
+                guard let session else { throw LumixError.notReady("no session") }
+                settings = try await session.fetchExposureSettings()
+                // The option lists rarely change; fetch once per session.
+                if menuOptions == nil || refreshOptions {
+                    menuOptions = try? await session.menuOptions(forceRefresh: refreshOptions)
+                }
+            } catch {
+                settingsError = error.localizedDescription
+                logWarn(.command, "settings load failed", detail: error.localizedDescription)
+            }
+            isLoadingSettings = false
+        }
+    }
+
+    /// Selectable values. Shutter and aperture come from the lens limits;
+    /// ISO, exposure and WB come from the camera's own enabled menu entries.
+    func choices(for key: SettingKey) -> [String] {
+        switch key {
+        case .shutter: settings.lens?.shutterChoices ?? []
+        case .aperture: settings.lens?.apertureChoices ?? []
+        default: menuOptions?.choices(for: key) ?? []
+        }
+    }
+
+    func apply(_ key: SettingKey, value: String) {
+        guard !isLoadingSettings else { return }
+        isLoadingSettings = true
+        settingsError = nil
+        haptic(.light)
+        Task {
+            do {
+                guard let session else { throw LumixError.notReady("no session") }
+                _ = try await session.setSetting(key, value: value)
+                // Changing one exposure value can shift the others, so re-read
+                // the whole set rather than patching a single field.
+                settings = try await session.fetchExposureSettings()
+            } catch {
+                settingsError = error.localizedDescription
+                haptic(.rigid)
+            }
+            isLoadingSettings = false
+        }
+    }
+
     // MARK: - Developer console
 
     func runRaw(_ query: String) async -> String {

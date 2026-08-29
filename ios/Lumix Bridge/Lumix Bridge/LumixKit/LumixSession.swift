@@ -396,6 +396,18 @@ public actor LumixSession {
     public func startRecording() async throws {
         commandInFlight = true
         defer { commandInFlight = false }
+
+        // The camera can slip back to playback on its own. Recovering via the
+        // err_critical path would mean a needless re-pair, so if the keepalive
+        // already told us we're in playback, fix that first. Safe: we are
+        // provably not recording here.
+        if let mode = snapshot.state?.camMode, mode != "rec",
+           snapshot.state?.isRecording != true,
+           let host = snapshot.host, let sid = snapshot.sessionID {
+            logWarn(.command, "camera is in \(mode) — restoring record mode before rolling")
+            try await ensureRecordMode(host: host, sessionID: sid)
+        }
+
         let body = try await command("mode=camcmd&value=video_recstart")
         guard CamCGI.isOK(body) else {
             throw LumixError.cameraError(CamCGI.result(body) ?? "unknown")
@@ -429,6 +441,111 @@ public actor LumixSession {
         }
     }
 
+    // MARK: - Exposure settings
+    //
+    // Strictly on demand. NOTHING here runs on a timer and nothing is added to
+    // the keepalive: holding the session for the shutter is the priority, so
+    // settings traffic only happens when the user opens the sheet or taps a
+    // value. `curmenu` is ~66KB, so it is fetched at most once per session.
+
+    private var cachedMenu: MenuOptions?
+
+    /// Settings are unreadable in playback and must never be touched mid-take.
+    private func requireSettingsAccess() throws -> (host: String, sid: String) {
+        guard snapshot.phase.isReady,
+              let host = snapshot.host,
+              let sid = snapshot.sessionID else {
+            throw LumixError.notReady(snapshot.phase.label)
+        }
+        if snapshot.state?.isRecording == true {
+            throw LumixError.cameraError("settings are locked while recording")
+        }
+        if let mode = snapshot.state?.camMode, mode != "rec" {
+            throw LumixError.cameraError("camera is in \(mode) mode")
+        }
+        return (host, sid)
+    }
+
+    /// One batch: five getsetting calls plus the lens limits. ~1.5KB total.
+    public func fetchExposureSettings() async throws -> ExposureSettings {
+        let (host, sid) = try requireSettingsAccess()
+        commandInFlight = true
+        defer { commandInFlight = false }
+
+        var out = ExposureSettings()
+        for key in SettingKey.allCases {
+            guard let body = try? await transport.cgi(
+                host: host, query: "mode=getsetting&type=\(key.rawValue)",
+                sessionID: sid, timeout: 6, category: .command) else { continue }
+            // <settingvalue iso="auto"></settingvalue>
+            if let v = Self.settingValue(body, key: key.rawValue) {
+                out.values[key.rawValue] = v
+            }
+        }
+
+        if let lensBody = try? await transport.cgi(
+            host: host, query: "mode=getinfo&type=lens",
+            sessionID: sid, timeout: 8, category: .command) {
+            out.lens = LensInfo(csv: lensBody)     // CSV, not XML
+        }
+
+        out.fetchedAt = Date()
+        logInfo(.command, "settings read: " + SettingKey.allCases
+            .map { "\($0.rawValue)=\(out.raw($0) ?? "-")" }.joined(separator: " "))
+        return out
+    }
+
+    /// Option lists. Cached for the session — this is the only large request.
+    public func menuOptions(forceRefresh: Bool = false) async throws -> MenuOptions {
+        if let cachedMenu, !forceRefresh { return cachedMenu }
+        let (host, sid) = try requireSettingsAccess()
+        commandInFlight = true
+        defer { commandInFlight = false }
+
+        let body = try await transport.cgi(host: host, query: "mode=getinfo&type=curmenu",
+                                           sessionID: sid, timeout: 15, category: .command)
+        let menu = MenuOptions(curmenu: body)
+        cachedMenu = menu
+        logInfo(.command, "curmenu cached (\(body.count) bytes)")
+        return menu
+    }
+
+    /// Writes one setting and reads it straight back. Returns the readback.
+    @discardableResult
+    public func setSetting(_ key: SettingKey, value: String) async throws -> String {
+        let (host, sid) = try requireSettingsAccess()
+        commandInFlight = true
+        defer { commandInFlight = false }
+
+        let body = try await transport.cgi(
+            host: host,
+            query: "mode=setsetting&type=\(key.rawValue)&value=\(value.urlPathEncoded)",
+            sessionID: sid, timeout: 8, category: .command)
+
+        guard CamCGI.isOK(body) else {
+            let err = CamCGI.result(body) ?? "unknown"
+            logWarn(.command, "set \(key.rawValue)=\(value) rejected: \(err)")
+            throw LumixError.cameraError(err)
+        }
+
+        try? await Task.sleep(for: .milliseconds(400))
+        let readBody = try await transport.cgi(
+            host: host, query: "mode=getsetting&type=\(key.rawValue)",
+            sessionID: sid, timeout: 6, category: .command)
+        let now = Self.settingValue(readBody, key: key.rawValue) ?? value
+        logInfo(.command, "set \(key.rawValue) = \(now)")
+        // Changing one exposure value can shift the others; the caller re-reads.
+        return now
+    }
+
+    /// Pulls `key="value"` out of `<settingvalue key="value">`.
+    private static func settingValue(_ body: String, key: String) -> String? {
+        guard let r = body.range(of: "\(key)=\"") else { return nil }
+        let rest = body[r.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[..<end])
+    }
+
     /// Raw passthrough for the developer console.
     public func rawCommand(_ query: String) async throws -> String {
         guard let host = snapshot.host else { throw LumixError.notReady("no camera") }
@@ -440,5 +557,13 @@ public actor LumixSession {
 extension String {
     var urlQueryEncoded: String {
         addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? self
+    }
+
+    /// Setting values such as "1792/256" and "-2/3" are sent with the slash and
+    /// sign literal — that is the form the camera accepted under test.
+    var urlPathEncoded: String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "/-_.")
+        return addingPercentEncoding(withAllowedCharacters: allowed) ?? self
     }
 }

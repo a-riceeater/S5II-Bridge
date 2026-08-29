@@ -231,6 +231,66 @@ Rules:
    keepalive is normal; require several consecutive misses before reconnecting,
    and never reconnect while `<rec>` is `on`.
 
+## 5c. Exposure settings (read + write)
+
+All confirmed round-tripping on `DC-S5M2` fw 3.61, **only while `cammode=rec`**.
+In playback every one of these returns `err_busy` / `err_critical`.
+
+| Setting | `type=` | Value form | Example |
+|---|---|---|---|
+| Shutter | `shtrspeed` | `n/256`, denominator = `2^(n/256)` | `1792/256` = 1/125 |
+| Aperture | `focal` | `n/256`, f-number = `2^(n/512)` | `1024/256` = f/4.0 |
+| ISO | `iso` | `auto` or a number | `800` |
+| Exposure comp | `exposure` | EV in thirds | `1/3`, `0`, `-2/3` |
+| White balance | `whitebalance` | token | `cloudy` |
+| Video mode | `videoquality` | token | `mov_24p_200mbps_6k_10bit` |
+| Container | `videoformat` | `mov` / `mp4` / `mp4ed` / `mp4lite` | `mov` |
+
+A full stop is **256** in both the shutter and aperture numerators, so a third of
+a stop is `256/3`. Invalid values are rejected with `err_param` and leave the
+current value untouched.
+
+```
+GET /cam.cgi?mode=getsetting&type=shtrspeed
+    -> <camrply><result>ok</result><settingvalue shtrspeed="1536/256"></settingvalue></camrply>
+GET /cam.cgi?mode=setsetting&type=shtrspeed&value=1792/256
+    -> <camrply><result>ok</result></camrply>
+```
+
+### Option lists
+
+`getinfo&type=curmenu` (~65 KB, ~120 ms) is a flat list of
+`<item id="menu_item_id_X" enable="yes|no" value="…">`. The parent carries the
+current value; children `menu_item_id_X_<token>` are the options, and only
+`enable="yes"` ones are selectable in the camera's current state.
+
+**The menu prefix is not always the setting type:**
+
+| Setting type | Menu prefix |
+|---|---|
+| `iso` | `sensitivity` |
+| `videoquality` | `v_quality` |
+| `whitebalance`, `exposure`, `videoformat` | same |
+
+Shutter and aperture have **no** menu entries — they are continuous and bounded
+by the lens.
+
+### Lens limits — CSV, not XML
+
+`getinfo&type=lens` breaks the pattern and returns plain CSV:
+
+```
+ok,2304/256,935/256,3584/256,1195/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,8433,512,
+   [1] max f-number  f/22      [3] fastest shutter 1/16000
+   [2] min f-number  f/3.5     [4] slowest shutter 1/25       [14] lens name
+```
+
+### Cost
+
+A full settings read is **~700 bytes / ~350 ms** for five `getsetting` calls plus
+`lens`. `curmenu` is the only large request and only needs fetching once per
+session. None of this belongs on a timer — see the keepalive rules above.
+
 ## 5b. Capability document
 
 `mode=getinfo&type=capability` (session required) returns ~6.5 KB:
