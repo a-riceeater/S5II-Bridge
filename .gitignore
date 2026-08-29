@@ -10,3 +10,10 @@ tools/.lumix_cameras.json
 
 *.log
 cap.xml
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+*.xcworkspace/xcuserdata/

@@ -1,0 +1,390 @@
+//
+//  LumixSession.swift
+//  Lumix Bridge
+//
+//  Owns the camera session for the lifetime of the app.
+//
+//  The S5II expects ONE controller that stays connected. Anything that pairs,
+//  fires a command and goes away leaves the camera showing "connection failed",
+//  after which it drops out of remote mode and starts accepting TCP on :60606
+//  while never answering HTTP. So this object connects once and holds on.
+//
+//  Holding the session is also what makes the shutter fast: a warm session gives
+//  recstart in 12-70ms, while a cold one costs ~6.5s because the play->rec
+//  transition (~5s) is paid per session.
+//
+
+import Foundation
+
+public enum ConnectionPhase: Sendable, Equatable {
+    case disconnected
+    case searching
+    case connecting
+    case ready
+    /// Terminal until the operator re-arms the body. Never auto-retried.
+    case refused(String)
+    case failed(String)
+
+    public var isReady: Bool { self == .ready }
+
+    public var label: String {
+        switch self {
+        case .disconnected: "Disconnected"
+        case .searching:    "Searching…"
+        case .connecting:   "Connecting…"
+        case .ready:        "Ready"
+        case .refused:      "Refused"
+        case .failed:       "Error"
+        }
+    }
+}
+
+public struct SessionSnapshot: Sendable, Equatable {
+    public var phase: ConnectionPhase = .disconnected
+    public var camera: CameraInfo?
+    public var host: String?
+    public var sessionID: String?
+    public var state: CameraState?
+    public var message: String = ""
+}
+
+public actor LumixSession {
+
+    // Timings, all measured on DC-S5M2 fw 3.61.
+    static let sessionIdleTimeout: TimeInterval = 12.0   // dies at ~12s of silence
+    static let keepaliveInterval: TimeInterval = 3.0     // comfortable margin
+    static let recSettleTimeout: TimeInterval = 6.0      // recstop takes ~1.95s
+    static let recModeTimeout: TimeInterval = 20.0       // play->rec takes ~5s
+    static let promptWindow: TimeInterval = 240.0        // a human must walk over
+
+    private let transport: LumixTransport
+    private let discovery: LumixDiscovery
+
+    public private(set) var clientName: String
+    public private(set) var nameEncoding: PairingCodec.NameEncoding
+
+    private var snapshot = SessionSnapshot()
+    private var keepaliveTask: Task<Void, Never>?
+    private var commandInFlight = false
+
+    private let onChange: @Sendable (SessionSnapshot) -> Void
+
+    public init(clientName: String = "S5II Bridge",
+                nameEncoding: PairingCodec.NameEncoding = .utf16LE,
+                onChange: @escaping @Sendable (SessionSnapshot) -> Void) {
+        let transport = LumixTransport()
+        self.transport = transport
+        self.discovery = LumixDiscovery(transport: transport)
+        self.clientName = clientName
+        self.nameEncoding = nameEncoding
+        self.onChange = onChange
+    }
+
+    // MARK: - Snapshot plumbing
+
+    private func publish() { onChange(snapshot) }
+
+    private func setPhase(_ phase: ConnectionPhase, _ message: String = "") {
+        snapshot.phase = phase
+        snapshot.message = message
+        publish()
+    }
+
+    public func currentSnapshot() -> SessionSnapshot { snapshot }
+
+    public func setClientName(_ name: String, encoding: PairingCodec.NameEncoding) {
+        clientName = name
+        nameEncoding = encoding
+    }
+
+    public func seedCachedHost(_ host: String?) async {
+        await discovery.seedCache(host: host)
+    }
+
+    // MARK: - Connect
+
+    /// Full bring-up: find the camera, pair, and leave it in record mode.
+    public func connect(preferredUDN: String? = nil) async {
+        guard snapshot.phase != .searching, snapshot.phase != .connecting else { return }
+
+        setPhase(.searching)
+        guard let found = await discovery.find(udn: preferredUDN) else {
+            setPhase(.failed("No camera found"),
+                     "No Lumix camera answered on this network. If the camera is on, it may have dropped out of remote mode — re-arm it on the body.")
+            return
+        }
+
+        snapshot.camera = found.info
+        snapshot.host = found.host
+        setPhase(.connecting)
+
+        do {
+            let sid = try await pair(host: found.host, udn: found.info.udn)
+            snapshot.sessionID = sid
+            try await ensureRecordMode(host: found.host, sessionID: sid)
+            setPhase(.ready)
+            startKeepalive()
+            logInfo(.session, "READY — session \(sid)")
+        } catch LumixError.refused {
+            snapshot.sessionID = nil
+            setPhase(.refused("Camera refused"),
+                     "The camera is not armed to accept a new device. On the body: MENU → Setup → IN/OUT → LAN/Wi-Fi → Wi-Fi Function → New Connection → Remote Shooting & View.")
+            logError(.pairing, "REFUSED — not retrying (repeated refusals trip the camera's lockout)")
+        } catch {
+            snapshot.sessionID = nil
+            setPhase(.failed(error.localizedDescription), error.localizedDescription)
+            logError(.session, "connect failed", detail: error.localizedDescription)
+        }
+    }
+
+    public func disconnect() {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+        snapshot.sessionID = nil
+        snapshot.state = nil
+        setPhase(.disconnected)
+        logInfo(.session, "disconnected")
+    }
+
+    /// Clears a `refused`/`failed` phase so the user can retry after re-arming.
+    public func reset() {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+        snapshot = SessionSnapshot()
+        publish()
+    }
+
+    // MARK: - Pairing
+
+    /// req_acc_g arms a single pending request slot; req_acc_e polls it.
+    /// Re-sending an identical req_acc_e polls the SAME request — sending a
+    /// different one, or re-arming, replaces it and orphans any acceptance the
+    /// operator has already given.
+    private func pair(host: String, udn: String) async throws -> String {
+        let value = PairingCodec.encodeUDN(udn)
+        let value2 = PairingCodec.encodeName(clientName, as: nameEncoding)
+        logInfo(.pairing, "pairing as \"\(clientName)\" [\(nameEncoding.rawValue)]",
+                detail: "value2=\(value2)")
+
+        _ = try? await transport.cgi(host: host, query: "mode=accctrl&type=req_acc_g",
+                                     timeout: 6, category: .pairing)
+
+        var deadline = Date().addingTimeInterval(30)
+        var rearms = 0
+        var prompted = false
+
+        while Date() < deadline {
+            let body = try await transport.cgi(
+                host: host,
+                query: "mode=accctrl&type=req_acc_e&value=\(value)&value2=\(value2)",
+                timeout: 8, category: .pairing)
+
+            switch PairState(csv: body.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            case .granted(let sid):
+                logInfo(.pairing, "granted — session \(sid)")
+                // Confirm the connection by registering our display name.
+                _ = try? await transport.cgi(
+                    host: host,
+                    query: "mode=setsetting&type=device_name&value=\(clientName.urlQueryEncoded)",
+                    sessionID: sid, timeout: 6, category: .pairing)
+                return sid
+
+            case .promptingOperator:
+                if !prompted {
+                    prompted = true
+                    // A dialog is up and a human has to walk to the camera.
+                    // Extend generously and NEVER re-arm while it's displayed.
+                    deadline = Date().addingTimeInterval(Self.promptWindow)
+                    setPhase(.connecting,
+                             "Confirm the connection on the camera screen.")
+                    logWarn(.pairing, "camera is prompting the operator — waiting up to \(Int(Self.promptWindow))s")
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+
+            case .decidingSilently:
+                try? await Task.sleep(for: .milliseconds(300))
+
+            case .refused:
+                // Hard stop. Each refusal feeds a counter that ends in the
+                // camera's "invalid login" lockout and a forced power cycle.
+                throw LumixError.refused
+
+            case .othersRequesting, .critical, .unknown:
+                rearms += 1
+                guard rearms <= 3 else {
+                    throw LumixError.notArmed("stuck after \(rearms) re-arms")
+                }
+                logWarn(.pairing, "stale request slot — re-arming (\(rearms)/3)")
+                try? await Task.sleep(for: .seconds(1))
+                _ = try? await transport.cgi(host: host,
+                                             query: "mode=accctrl&type=req_acc_g",
+                                             timeout: 6, category: .pairing)
+            }
+        }
+        throw LumixError.notArmed("pairing not granted in time")
+    }
+
+    // MARK: - Record mode
+
+    /// After every fresh pairing the camera reports cammode=play, and
+    /// video_recstart returns err_critical until it's switched. The transition
+    /// takes ~5s and the HTTP server stops answering during part of it.
+    private func ensureRecordMode(host: String, sessionID: String) async throws {
+        if let s = await fetchState(host: host, sessionID: sessionID), s.isInRecordMode {
+            snapshot.state = s
+            return
+        }
+        logInfo(.session, "camera is in playback — switching to record (~5s)")
+        setPhase(.connecting, "Switching camera to record mode…")
+
+        _ = try? await transport.cgi(host: host, query: "mode=camcmd&value=recmode",
+                                     sessionID: sessionID, timeout: 12, category: .command)
+
+        let deadline = Date().addingTimeInterval(Self.recModeTimeout)
+        while Date() < deadline {
+            if let s = await fetchState(host: host, sessionID: sessionID), s.isInRecordMode {
+                snapshot.state = s
+                logInfo(.session, "record mode active")
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+        }
+        throw LumixError.cameraError("camera did not enter record mode")
+    }
+
+    // MARK: - State
+
+    private func fetchState(host: String, sessionID: String,
+                            quiet: Bool = true) async -> CameraState? {
+        guard let body = try? await transport.cgi(host: host, query: "mode=getstate",
+                                                  sessionID: sessionID, timeout: 4,
+                                                  category: .session),
+              CamCGI.isOK(body) else { return nil }
+        return CameraState(dict: CamCGI.state(body))
+    }
+
+    // MARK: - Keepalive
+
+    /// The session dies after ~12s of silence. getstate doubles as the state
+    /// feed, so keeping it warm costs nothing extra (~400 bytes every 3s).
+    private func startKeepalive() {
+        keepaliveTask?.cancel()
+        keepaliveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(LumixSession.keepaliveInterval))
+                guard let self else { return }
+                await self.keepaliveTick()
+            }
+        }
+    }
+
+    private func keepaliveTick() async {
+        guard snapshot.phase.isReady,
+              let host = snapshot.host,
+              let sid = snapshot.sessionID,
+              !commandInFlight else { return }
+
+        if let s = await fetchState(host: host, sessionID: sid) {
+            if snapshot.state != s {
+                snapshot.state = s
+                publish()
+            }
+        } else {
+            logWarn(.session, "keepalive lost the session — reconnecting")
+            keepaliveTask?.cancel()
+            keepaliveTask = nil
+            snapshot.sessionID = nil
+            setPhase(.disconnected)
+            await connect(preferredUDN: snapshot.camera?.udn)
+        }
+    }
+
+    // MARK: - Commands
+
+    /// Sends a command, transparently re-pairing once if the session lapsed.
+    @discardableResult
+    private func command(_ query: String) async throws -> String {
+        guard let host = snapshot.host, let sid = snapshot.sessionID else {
+            throw LumixError.notReady(snapshot.phase.label)
+        }
+        let body = try await transport.cgi(host: host, query: query,
+                                           sessionID: sid, timeout: 8)
+        guard CamCGI.result(body) == "err_critical" else { return body }
+
+        logWarn(.session, "err_critical — session expired, re-pairing")
+        let newSID = try await pair(host: host, udn: snapshot.camera?.udn ?? "")
+        snapshot.sessionID = newSID
+        try await ensureRecordMode(host: host, sessionID: newSID)
+        publish()
+        return try await transport.cgi(host: host, query: query,
+                                       sessionID: newSID, timeout: 8)
+    }
+
+    /// <rec> is not a synchronous ack: it flips to "on" in ~11ms but takes
+    /// ~1.95s to reach "off" while the clip is finalised. Poll until it settles,
+    /// otherwise a toggle reads a stale value and does the opposite.
+    @discardableResult
+    private func awaitRecording(_ expected: Bool) async -> Bool {
+        guard let host = snapshot.host, let sid = snapshot.sessionID else { return false }
+        let deadline = Date().addingTimeInterval(Self.recSettleTimeout)
+        while Date() < deadline {
+            if let s = await fetchState(host: host, sessionID: sid) {
+                snapshot.state = s
+                publish()
+                if s.isRecording == expected { return true }
+            }
+            try? await Task.sleep(for: .milliseconds(120))
+        }
+        logWarn(.command, "recording state did not settle to \(expected)")
+        return false
+    }
+
+    public func startRecording() async throws {
+        commandInFlight = true
+        defer { commandInFlight = false }
+        let body = try await command("mode=camcmd&value=video_recstart")
+        guard CamCGI.isOK(body) else {
+            throw LumixError.cameraError(CamCGI.result(body) ?? "unknown")
+        }
+        logInfo(.command, "record START")
+        await awaitRecording(true)
+    }
+
+    public func stopRecording() async throws {
+        commandInFlight = true
+        defer { commandInFlight = false }
+        let body = try await command("mode=camcmd&value=video_recstop")
+        guard CamCGI.isOK(body) else {
+            throw LumixError.cameraError(CamCGI.result(body) ?? "unknown")
+        }
+        logInfo(.command, "record STOP")
+        await awaitRecording(false)   // ~2s while the clip is finalised
+    }
+
+    /// Reads fresh state first — the cached keepalive sample may be up to 3s old.
+    public func toggleRecording() async throws {
+        guard let host = snapshot.host, let sid = snapshot.sessionID else {
+            throw LumixError.notReady(snapshot.phase.label)
+        }
+        let live = await fetchState(host: host, sessionID: sid)
+        if let live { snapshot.state = live; publish() }
+        if live?.isRecording == true {
+            try await stopRecording()
+        } else {
+            try await startRecording()
+        }
+    }
+
+    /// Raw passthrough for the developer console.
+    public func rawCommand(_ query: String) async throws -> String {
+        guard let host = snapshot.host else { throw LumixError.notReady("no camera") }
+        return try await transport.cgi(host: host, query: query,
+                                       sessionID: snapshot.sessionID, timeout: 8)
+    }
+}
+
+extension String {
+    var urlQueryEncoded: String {
+        addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? self
+    }
+}

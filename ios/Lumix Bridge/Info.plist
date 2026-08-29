@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The camera speaks plain HTTP on a private LAN address (e.g. http://10.0.0.177).
+	  App Transport Security blocks that by default. NSAllowsLocalNetworking permits
+	  local-network loads only; it does NOT disable ATS for the public internet, so
+	  this is the narrow exception rather than NSAllowsArbitraryLoads.
+	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!--
+	  Discovery sweeps the local subnet and the camera lives there, so iOS will
+	  prompt for local network access on first use. Xcode merges the
+	  INFOPLIST_KEY_* build settings into this file at build time.
+	-->
+</dict>
+</plist>

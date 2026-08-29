@@ -58,11 +58,35 @@ silent.
 | `tools/lumix.py` | Protocol layer: `cam.cgi` verbs, pairing, session, keepalive |
 | `tools/discover.py` | UDN-keyed discovery with address caching |
 | `tools/probe.py` | Port scan / SSDP / device-description dump for diagnostics |
+| `ios/Lumix Bridge/` | Native iOS app (SwiftUI, Liquid Glass) built on the same protocol |
 | [`LUMIX_S5II_LAN_RECORD_CONTROL.md`](LUMIX_S5II_LAN_RECORD_CONTROL.md) | The wire protocol, with exact requests and what's confirmed vs inferred |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Structure, and how it maps onto a planned iOS client |
 
 `tools/lumix.py` also works standalone (`python tools/lumix.py cycle --seconds 5`) but is
 meant for protocol poking — it has the abandoned-session problem by construction.
+
+## iOS app
+
+`ios/Lumix Bridge` is a native SwiftUI client. It holds the session exactly the way
+`bridge.py` does — one long-lived `LumixSession` actor for the app's lifetime.
+
+- **Finds the camera itself** — subnet sweep, no IP entry, no multicast entitlement
+- **Optimistic shutter** — the button flips instantly and reconciles against the camera;
+  `stop` shows a real "Stopping…" state for the ~2 s the camera takes to finalise a clip
+- **Developer console** — every request/response with level and category filters, search,
+  export, plus a raw `cam.cgi` prompt that runs against the live session
+
+| | |
+|---|---|
+| `LumixKit/LumixTransport.swift` | HTTP with per-request timeouts |
+| `LumixKit/CamCGI.swift` | Wire format, pairing codec, state parsing |
+| `LumixKit/LumixDiscovery.swift` | Subnet sweep, UDN-keyed |
+| `LumixKit/LumixSession.swift` | Pairing, keepalive, recovery, record verbs |
+| `LumixKit/DevLog.swift` | In-memory ring buffer behind the developer view |
+
+Requires iOS 26. Two Info.plist keys are wired up already and are both mandatory:
+`NSLocalNetworkUsageDescription` (subnet sweep) and `NSAppTransportSecurity →
+NSAllowsLocalNetworking` (the camera speaks plain HTTP on a private address).
 
 ## Protocol in one block
 
