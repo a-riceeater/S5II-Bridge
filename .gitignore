@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Runtime state written by the tools -- session tokens and discovered addresses.
+# Session ids are short-lived credentials; never commit them.
+.lumix_session.json
+.lumix_cameras.json
+tools/.lumix_session.json
+tools/.lumix_cameras.json
+
+*.log
+cap.xml

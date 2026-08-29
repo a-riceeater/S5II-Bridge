@@ -1,0 +1,411 @@
+# Lumix S5II — video record start/stop over LAN
+
+Reverse-engineered against a real body. Target: a low-bandwidth remote shutter with
+**no live-view stream**.
+
+| | |
+|---|---|
+| Model | `DC-S5M2` (`friendlyName` `S5M2-E86421`) |
+| Firmware | `3.61` (`pana:X_FirmVersion`) |
+| UDN | `uuid:4D454930-0100-1000-8000-A0CDF3E86421` |
+| IP under test | `10.0.0.177` (DHCP, same /24 as client) |
+| Protocol | Plain HTTP `GET` to `/cam.cgi`, XML replies. No TLS, no auth beyond a session token. |
+
+**Headline result: live view is completely avoidable.** Recording was driven start-to-finish
+without ever calling `startstream`. Steady-state cost is one ~400-byte keepalive every few
+seconds plus ~200 bytes per command — versus the multi-Mbit/s MJPEG stream Lumix Sync opens.
+
+---
+
+## 1. Ports
+
+Scanned on `10.0.0.177`:
+
+| Port | State | Purpose |
+|------|-------|---------|
+| 80 | **open** | `/cam.cgi` control API — everything below |
+| 60606 | **open** | UPnP device description (`/Lumix/Server0/ddd`) |
+| 50001 | **open** | Accepts TCP, returns nothing to HTTP/RTSP probes. Not needed. *(purpose unconfirmed)* |
+| 554, 1900, 5000, 8080, 15740, 49152 | closed | No RTSP, **no PTP/IP** |
+
+Port 15740 being closed matters: **LUMIX Tether's PTP/IP path is not available over Wi-Fi.**
+Panasonic's docs confirm Tether-over-LAN requires a USB-Ethernet adaptor and disables Wi-Fi
+and Bluetooth while active. So `cam.cgi` is the only route for a Wi-Fi client.
+
+## 2. Discovery
+
+The device description carries the UDN needed for the handshake:
+
+```bash
+curl -s http://10.0.0.177:60606/Lumix/Server0/ddd
+```
+
+```xml
+<friendlyName>S5M2-E86421</friendlyName>
+<manufacturer>Panasonic</manufacturer>
+<modelName>LUMIX</modelName>
+<modelNumber>DC-S5M2</modelNumber>
+<serialNumber>000000000000000000XXXXXXXXXXXX</serialNumber>
+<UDN>uuid:4D454930-0100-1000-8000-A0CDF3E86421</UDN>
+<pana:X_FirmVersion>3.61</pana:X_FirmVersion>
+```
+
+A bare `GET http://10.0.0.177:60606/` returns `404` — useful as a fast "is the camera awake"
+probe without waiting on a TCP timeout.
+
+`ddd` is also served at `/Server0/ddd` on older bodies; try `/Lumix/Server0/ddd` first.
+
+> An SSDP `M-SEARCH` to `239.255.255.250:1900` returned nothing here, but the local Windows
+> firewall blocked *all* SSDP replies on this host, so this is **untested**, not a negative
+> result. Fixed IP or an ARP/`:60606` sweep is the reliable discovery method regardless.
+
+## 3. Pairing handshake
+
+The legacy `mode=accctrl&type=req_acc` handshake is **gone** on this firmware — it returns
+`err_param`. Firmware 3.61 uses a two-step `req_acc_g` / `req_acc_e` flow.
+
+```
+GET /cam.cgi?mode=accctrl&type=req_acc_g
+    -> ok,7cfd35c2                       # arms a pending request slot, returns a nonce
+
+GET /cam.cgi?mode=accctrl&type=req_acc_e&value=<hex(UDN)>&value2=<hex(client name)>
+    -> ok_under_research,S5M2-E86421,remote,open           # deciding (may prompt on screen)
+    -> ok_under_research_no_msg,S5M2-E86421,remote,open    # deciding silently (known device)
+    -> ok,S5M2-E86421,remote,open,F203CA4BF50DC91F         # granted; last field = SESSION_ID
+```
+
+- `value` and `value2` are **lowercase hex of the ASCII bytes**. The UDN is sent *without*
+  the `uuid:` prefix: `4D454930-...` → `34443435343933302d...`.
+- These replies are **plain text CSV, not XML** — unlike every other endpoint. Parse both.
+- The camera holds **exactly one pending request slot**. Re-sending an *identical* `req_acc_e`
+  polls that same request; a *different* `value`/`value2` while one is pending returns
+  `err_others_requesting`.
+- The `req_acc_g` nonce never had to be used. It stays constant while a request is pending
+  and rotates on re-arm — a frozen nonce is a reliable sign the slot is stuck. *(Its intended
+  use is unconfirmed; pairing succeeds without referencing it.)*
+
+Poll `req_acc_e` every 500 ms until it returns `ok`. Once a client name has been accepted
+the camera **remembers it**: later pairings return `ok_under_research_no_msg` and grant in
+~650 ms with no operator action.
+
+> **Do not re-arm while a prompt is up.** `ok_under_research` (without `_no_msg`) means the
+> camera is showing a dialog and waiting on a human. Sending another `req_acc_g` *replaces*
+> the pending request, so the operator's acceptance lands on a request you already
+> abandoned — the connection appears to hang forever and the on-screen name can blank to
+> `-`. Allow a human-scale window (~240 s) and poll the *same* `req_acc_e` throughout.
+
+### Session token
+
+Every subsequent request must carry the session as a header:
+
+```
+X-SESSION_ID: F203CA4BF50DC91F
+```
+
+Without it **every** endpoint returns `<result>err_critical</result>` — including `getstate`.
+There is no cookie, no sequence number, and no per-request signature.
+
+### ⚠️ The lockout — the one genuinely destructive failure mode
+
+`err_user_refused` means the body is **not armed to accept a new remote device**. It is
+returned automatically within ~3 s, with no prompt shown to anyone.
+
+**Never retry after `err_user_refused`.** The camera counts refused attempts and after a
+handful displays *"An invalid login occurred. Please turn the power off and then on again"*,
+drops off the network entirely, and requires a physical power cycle. This was hit during
+testing by a retry loop that re-armed on refusal.
+
+`err_critical` and `err_others_requesting` during pairing are *not* refusals — they mean a
+stale slot or that the body has left remote mode. Re-arming with `req_acc_g` can clear a
+stale slot; bound it to ~3 attempts.
+
+### Arming the camera
+
+For a *new* client, the body must be sitting in remote-shooting mode:
+
+> `MENU` → **Setup** (wrench) → **IN/OUT** → **LAN / Wi-Fi** → **Wi-Fi Function** →
+> **New Connection** → **Remote Shooting & View** → **Via Network** → select the AP
+
+Simply being joined to Wi-Fi for Lumix Sync image transfer is **not** enough — that state
+auto-refuses. Once a client name has been granted once, later pairings are silent
+(`ok_under_research_no_msg`) and need no operator action — **but only while the body stays in
+remote mode.** It drops out of remote mode after hard connection failures, after which
+`req_acc_e` returns `err_critical` with a frozen nonce until it is re-armed by hand.
+
+## 4. Camera mode — the easy thing to miss
+
+**After every fresh pairing the camera reports `<cammode>play</cammode>`**, and
+`video_recstart` returns `err_critical` in that state. You must send `recmode` first:
+
+```
+GET /cam.cgi?mode=camcmd&value=recmode      -> <result>ok</result>
+```
+
+This transition takes **~5 s**, and the HTTP server stops answering for part of it — expect
+timeouts and poll `getstate` tolerantly until `<cammode>rec</cammode>`. This ~5 s is the
+single largest latency in the whole system, and it is paid **once per session**, not per take.
+
+## 5. Record start / stop
+
+```
+GET /cam.cgi?mode=camcmd&value=video_recstart
+    Header: X-SESSION_ID: <session>
+    -> <?xml version="1.0" encoding="UTF-8"?><camrply><result>ok</result></camrply>
+
+GET /cam.cgi?mode=camcmd&value=video_recstop
+    Header: X-SESSION_ID: <session>
+    -> <?xml version="1.0" encoding="UTF-8"?><camrply><result>ok</result></camrply>
+```
+
+Raw HTTP:
+
+```http
+GET /cam.cgi?mode=camcmd&value=video_recstart HTTP/1.1
+Host: 10.0.0.177
+X-SESSION_ID: F203CA4BF50DC91F
+Connection: keep-alive
+```
+
+`curl`:
+
+```bash
+SID=F203CA4BF50DC91F
+curl -s -H "X-SESSION_ID: $SID" "http://10.0.0.177/cam.cgi?mode=camcmd&value=video_recstart"
+curl -s -H "X-SESSION_ID: $SID" "http://10.0.0.177/cam.cgi?mode=camcmd&value=video_recstop"
+```
+
+> **`mode=camcmd&type=video_recstart` is wrong** — it returns `err_param`. The parameter is
+> `value`, not `type`. (The `liblumix` C++ driver enumerates these under `type`; that path is
+> dead code there and does not work on this firmware.)
+
+### Confirming it actually rolled
+
+`getstate` is authoritative — `<rec>` flips and `video_remaincapacity` (seconds remaining)
+counts down:
+
+```
+before  <rec>off</rec><cammode>rec</cammode><video_remaincapacity>8983</video_remaincapacity>
+during  <rec>on</rec> <cammode>rec</cammode><video_remaincapacity>8982</video_remaincapacity>
+during  <rec>on</rec> <cammode>rec</cammode><video_remaincapacity>8979</video_remaincapacity>
+```
+
+**`<rec>` does not settle instantly.** Measured:
+
+| Transition | Time for `<rec>` to reflect it |
+|---|---|
+| `recstart` → `on` | **~11 ms** (effectively immediate) |
+| `recstop` → `off` | **~1.95 s** (camera finalises the clip) |
+
+A client that reads state immediately after `recstop` sees `on` and will get a toggle
+backwards. Poll until it settles (allow ~6 s) before acting on it.
+
+Full `getstate` payload (~400 bytes):
+
+```xml
+<camrply><result>ok</result><state>
+  <batt>2/5</batt><batt_per>-1</batt_per>
+  <rec>off</rec><cammode>rec</cammode>
+  <video_remaincapacity>8983</video_remaincapacity>
+  <remaincapacity>3121</remaincapacity>
+  <sdcardstatus>write_enable</sdcardstatus><sd_memory>unset</sd_memory>
+  <version>VD4.80</version><temperature>low</temperature><sd_access>off</sd_access>
+</state></camrply>
+```
+
+## 5b. Capability document
+
+`mode=getinfo&type=capability` (session required) returns ~6.5 KB:
+
+```
+comm_proto_ver  10.0
+modelname       S5M2
+appname         LUMIX_Sync
+camcmdlist      tele-normal tele-fast wide-normal wide-fast poweroff 4kphoto_marking
+```
+
+Note the `camcmdlist` advertises only *optional extras* — the core verbs
+(`recmode`, `video_recstart`, `video_recstop`, `capture`) are **not** listed, so this is
+not a usable command-discovery mechanism. Other tags present: `camspeclist`, `asst_disp`,
+`crop_disp`, `autouploaddirlist`.
+
+**There is no disconnect / release-session verb**, here or anywhere else found. Graceful
+teardown is not available; the session can only be allowed to lapse.
+
+`mode=getsetting&type=device_name` returns `err_non_support` — the stored client name
+cannot be read back.
+
+## 6. Session lifetime and keepalive
+
+**Measured, fresh session per trial:**
+
+| Idle | Result |
+|------|--------|
+| 11 s | alive |
+| 12 s | **dead** |
+
+The session dies after **~12 s of silence**, after which everything returns `err_critical`.
+Any request resets the timer. Recommended keepalive: **`mode=getstate` every 3 s** — a
+comfortable margin, ~130 bytes/s of traffic, and it doubles as your record-state feed.
+
+Recovery from a dead session is cheap and needs no operator action *while the body is still in
+remote mode*: re-pair (~650 ms) then `recmode` (~5 s).
+
+## 7. Measured latency
+
+With the session and rec mode kept warm by a keepalive:
+
+| Operation | Time |
+|-----------|------|
+| `video_recstart` | **12–70 ms** |
+| `video_recstop` | **10–45 ms** |
+| `req_acc_g` + `req_acc_e` (known client) | ~650 ms |
+| `recmode` (play → rec) | ~5.0 s |
+| Cold: pair + recmode + recstart | ~6.5 s |
+
+The design conclusion is sharp: **hold the session open.** A warm session gives a
+~10–70 ms shutter. Letting it lapse costs ~6.5 s to get back to rolling, dominated by the
+mode switch.
+
+## 8. Reference client
+
+`tools/lumix.py` (stdlib only) implements all of the above — discovery, handshake, session
+cache, keepalive thread, `err_critical` auto-recovery, and refusal handling that will not
+trip the lockout.
+
+```bash
+python tools/lumix.py describe              # UPnP info, no session needed
+python tools/lumix.py pair                  # handshake, leaves camera in rec mode
+python tools/lumix.py state                 # parsed getstate
+python tools/lumix.py cycle --seconds 5     # start, hold 5s, stop
+python tools/lumix.py start
+python tools/lumix.py stop
+python tools/lumix.py raw --query "mode=getinfo&type=capability"
+```
+
+Minimal embeddable version:
+
+```python
+import re, time, urllib.request
+
+IP = "10.0.0.177"
+NAME = "shutter"
+
+def cgi(q, sid=None, timeout=8):
+    r = urllib.request.Request("http://%s/cam.cgi?%s" % (IP, q),
+                               headers={"X-SESSION_ID": sid} if sid else {})
+    return urllib.request.urlopen(r, timeout=timeout).read().decode()
+
+def pair():
+    ddd = urllib.request.urlopen("http://%s:60606/Lumix/Server0/ddd" % IP).read().decode()
+    udn = re.search(r"<UDN>uuid:(.*?)</UDN>", ddd).group(1)
+    cgi("mode=accctrl&type=req_acc_g")
+    q = ("mode=accctrl&type=req_acc_e&value=%s&value2=%s"
+         % (udn.encode().hex(), NAME.encode().hex()))
+    for _ in range(60):
+        body = cgi(q).strip()
+        state = body.split(",")[0]
+        if state == "ok":
+            return body.split(",")[-1]                 # session id
+        if state == "err_user_refused":
+            raise SystemExit("refused - arm the camera; DO NOT retry (lockout risk)")
+        time.sleep(0.5)                                 # ok_under_research*
+    raise SystemExit("pairing timed out")
+
+def cammode(sid):
+    m = re.search(r"<cammode>(\w+)</cammode>", cgi("mode=getstate", sid))
+    return m.group(1) if m else None
+
+sid = pair()
+if cammode(sid) != "rec":                               # always true after pairing
+    try: cgi("mode=camcmd&value=recmode", sid, timeout=12)
+    except Exception: pass                              # unresponsive mid-switch
+    t = time.time()
+    while time.time() - t < 20:
+        try:
+            if cammode(sid) == "rec": break
+        except Exception: pass
+        time.sleep(0.3)
+
+cgi("mode=camcmd&value=video_recstart", sid)
+time.sleep(5)                                           # keep pinging if longer than ~10s
+cgi("mode=camcmd&value=video_recstop", sid)
+```
+
+## 9. Recommended architecture for a shutter box
+
+1. On boot: `describe` → `pair` → `recmode`. Pay the ~5 s once.
+2. Run a keepalive thread: `getstate` every 3 s. Parse `<rec>` from it for free — that gives
+   you a rec tally light with zero extra traffic.
+3. Shutter press → `video_recstart` / `video_recstop`. ~10–70 ms.
+4. On any `err_critical`: re-pair, re-`recmode`, retry once.
+5. On `err_user_refused`: **stop and alert a human.** Do not retry.
+6. Never call `startstream`.
+
+Watch for: `<sdcardstatus>`, `<video_remaincapacity>` hitting 0, `<temperature>`, and
+`<batt>` (only 5 coarse steps; `batt_per` reads `-1` and is useless).
+
+## 10. Confirmed vs. inferred
+
+**Confirmed experimentally on this body:**
+
+- Ports 80 / 60606 / 50001 open; 15740, 554, 1900, 5000, 8080, 49152 closed
+- `ddd` endpoint, path, and all fields quoted above
+- Full `req_acc_g` → `req_acc_e` handshake, hex encoding, CSV replies, all six status strings
+- `X-SESSION_ID` mandatory; absent ⇒ `err_critical` on every endpoint
+- Legacy `type=req_acc` ⇒ `err_param`
+- One pending request slot; identical `req_acc_e` polls it, different one ⇒ `err_others_requesting`
+- Session idle timeout between 11 s (alive) and 12 s (dead)
+- Camera is in `play` mode after every pairing; `recmode` required; ~5 s; HTTP unresponsive during
+- `video_recstart` / `video_recstop` via `value=` → `ok`, verified by `<rec>on</rec>` and a
+  decrementing `video_remaincapacity`
+- `type=video_recstart` ⇒ `err_param`
+- Latencies in §7
+- Recording works with **no** `startstream` — live view fully avoidable
+- The "invalid login" lockout triggered by repeated `err_user_refused` (hit accidentally, recovered by power cycle)
+- Body silently leaves remote mode after hard failures; nonce freezes and `req_acc_e` ⇒ `err_critical` until re-armed
+- Hung state: port 60606 keeps **accepting TCP** while the HTTP server never responds
+  (5× consecutive 8 s timeouts) — TCP-open is not proof of a working camera
+- `<rec>` settle times: `on` ~11 ms, `off` ~1.95 s
+- Client names are remembered once accepted ⇒ later pairings are silent
+- Re-arming during `ok_under_research` orphans the operator's acceptance
+- `getinfo&type=capability` contents; `getsetting&type=device_name` ⇒ `err_non_support`
+- No disconnect/release verb exists in the capability document
+- Discovery by /24 sweep on :60606 — 0.78 s cold, ~40–134 ms from cache
+- A 3 s keepalive holds a session indefinitely (53 s+ observed, same session id, 0 reconnects)
+
+**Not confirmed / inferred:**
+
+- SSDP discovery — local firewall blocked all SSDP replies, so untested either way
+- Purpose of port 50001 (accepts TCP, silent to HTTP and RTSP probes)
+- Intended use of the `req_acc_g` nonce — pairing works without ever sending it back
+- Whether `value` should be the *client's* UUID rather than the camera's UDN. Older
+  documentation (`lumixproto`) describes it as a client UUID; sending the **camera's** UDN
+  works, and raw (non-hex) UDN was also accepted into `ok_under_research`. Not disambiguated.
+- Exact refusal count that trips the lockout (deliberately not re-tested)
+- 3 s keepalive is a recommendation with margin; only the ~12 s death boundary was measured
+- Behaviour on other firmware or S5IIX / GH6 / G9II bodies
+- **The `value2` encoding that renders the client name correctly on the connect prompt.**
+  `hex(utf-8)` renders as CJK squares. `hex(utf-16-le)` showed `-`, but that observation is
+  contaminated by the re-arm race above, so it is not a clean result. `setsetting
+  device_name` accepts plain, utf-8-hex, utf-16-le-hex and utf-16-be-hex all with `ok`, and
+  cannot be read back, so it gives no signal either. **Still open.**
+
+## 11. Non-network alternatives, briefly
+
+If the goal is shutter reliability rather than networking specifically, the S5II also has a
+**2.5 mm wired remote jack** (DMW-RS2 compatible — a trivial switch closure, zero protocol,
+zero latency, no pairing) and **BLE remote shutter** via the Lumix Sync pairing. The wired
+jack is by far the most robust trigger; the LAN path's real advantage is that it also gives
+you state feedback and works at distance.
+
+---
+
+## Sources
+
+- [njfdev/liblumix](https://github.com/njfdev/liblumix) — C++ driver developed against an
+  S5IIX; source of the `req_acc_g`/`req_acc_e` + `X-SESSION_ID` flow and the keepalive note
+- [cleverfox/lumixproto](https://github.com/cleverfox/lumixproto) — GX80 protocol notes,
+  original `video_recstart` / `video_recstop` documentation
+- [palmdalian/python_lumix_control](https://github.com/palmdalian/python_lumix_control) — classic `cam.cgi` client
+- [gphoto/libgphoto2 #409](https://github.com/gphoto/libgphoto2/issues/409) — Lumix HTTP/Wi-Fi protocol discussion
+- [Panasonic DC-S5M2X tethering docs](https://eww.pavc.panasonic.co.jp/dscoi/DC-S5M2X/html/DC-S5M2X_DVQP2992_eng/0152.html) — confirms Tether-over-LAN needs a USB-Ethernet adaptor and disables Wi-Fi/Bluetooth
