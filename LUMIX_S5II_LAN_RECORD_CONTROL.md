@@ -212,6 +212,25 @@ Full `getstate` payload (~400 bytes):
 </state></camrply>
 ```
 
+## 5a. ⚠️ Never send `recmode` while recording
+
+`mode=camcmd&value=recmode` during an active recording **hard-locks the camera**:
+the screen goes black and the body only recovers by removing the battery.
+Reproduced on `DC-S5M2` fw 3.61.
+
+This is easy to trigger by accident. The dangerous pattern is a client that treats
+an unreadable `getstate` as "probably in playback" and switches mode to be safe —
+the camera routinely stops answering for a beat right after `video_recstart`, so
+that heuristic fires exactly when recording has just begun.
+
+Rules:
+
+1. Only send `recmode` on a **positively confirmed** `cammode=play` **and** `rec=off`.
+2. Treat an unreadable state as "do not touch", never as "in playback".
+3. Never rebuild a session out from under an active take — a single missed
+   keepalive is normal; require several consecutive misses before reconnecting,
+   and never reconnect while `<rec>` is `on`.
+
 ## 5b. Capability document
 
 `mode=getinfo&type=capability` (session required) returns ~6.5 KB:
@@ -363,6 +382,8 @@ Watch for: `<sdcardstatus>`, `<video_remaincapacity>` hitting 0, `<temperature>`
 - Recording works with **no** `startstream` — live view fully avoidable
 - The "invalid login" lockout triggered by repeated `err_user_refused` (hit accidentally, recovered by power cycle)
 - Body silently leaves remote mode after hard failures; nonce freezes and `req_acc_e` ⇒ `err_critical` until re-armed
+- **`recmode` during an active recording hard-locks the camera** (black screen,
+  recovers only by pulling the battery)
 - Hung state: port 60606 keeps **accepting TCP** while the HTTP server never responds
   (5× consecutive 8 s timeouts) — TCP-open is not proof of a working camera
 - `<rec>` settle times: `on` ~11 ms, `off` ~1.95 s

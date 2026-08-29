@@ -246,9 +246,11 @@ private struct RawConsoleView: View {
             }
             .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
 
-            Text("Sent with the live session's X-SESSION_ID.")
+            Label("Sent with the live session's X-SESSION_ID. Do not send recmode while the camera is recording — it locks the body until the battery is pulled.",
+                  systemImage: "exclamationmark.triangle")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
         .overlay {

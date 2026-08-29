@@ -56,6 +56,9 @@ public actor LumixSession {
     static let recSettleTimeout: TimeInterval = 6.0      // recstop takes ~1.95s
     static let recModeTimeout: TimeInterval = 20.0       // play->rec takes ~5s
     static let promptWindow: TimeInterval = 240.0        // a human must walk over
+    /// Consecutive missed keepalives before declaring the session dead. The
+    /// camera routinely misses one right after a record command.
+    static let keepaliveFailureLimit = 3
 
     private let transport: LumixTransport
     private let discovery: LumixDiscovery
@@ -66,6 +69,7 @@ public actor LumixSession {
     private var snapshot = SessionSnapshot()
     private var keepaliveTask: Task<Void, Never>?
     private var commandInFlight = false
+    private var keepaliveFailures = 0
 
     private let onChange: @Sendable (SessionSnapshot) -> Void
 
@@ -229,11 +233,42 @@ public actor LumixSession {
     /// After every fresh pairing the camera reports cammode=play, and
     /// video_recstart returns err_critical until it's switched. The transition
     /// takes ~5s and the HTTP server stops answering during part of it.
+    ///
+    /// SAFETY: `recmode` must NEVER be sent while the camera is recording — it
+    /// hard-locks the body (black screen, recoverable only by pulling the
+    /// battery). So this only switches on a POSITIVELY confirmed
+    /// `cammode=play` + `rec=off`. An unreadable state is treated as "do not
+    /// touch", never as "probably in playback".
     private func ensureRecordMode(host: String, sessionID: String) async throws {
-        if let s = await fetchState(host: host, sessionID: sessionID), s.isInRecordMode {
-            snapshot.state = s
+        // Read state with retries: the camera is briefly unresponsive right
+        // after a record command, and a single nil here must not be mistaken
+        // for "in playback".
+        var observed: CameraState?
+        for attempt in 1...4 {
+            if let s = await fetchState(host: host, sessionID: sessionID) {
+                observed = s
+                break
+            }
+            logDebug(.session, "state unreadable while checking mode (\(attempt)/4)")
+            try? await Task.sleep(for: .milliseconds(400))
+        }
+
+        guard let state = observed else {
+            // Never guess. Guessing here is what sends recmode mid-recording.
+            throw LumixError.cameraError(
+                "could not read camera state; refusing to change mode blindly")
+        }
+        snapshot.state = state
+
+        if state.isRecording {
+            // Recording implies record mode. Switching now would lock the body.
+            logWarn(.session, "camera is RECORDING — not touching mode")
             return
         }
+        if state.isInRecordMode {
+            return
+        }
+
         logInfo(.session, "camera is in playback — switching to record (~5s)")
         setPhase(.connecting, "Switching camera to record mode…")
 
@@ -285,18 +320,35 @@ public actor LumixSession {
               !commandInFlight else { return }
 
         if let s = await fetchState(host: host, sessionID: sid) {
+            keepaliveFailures = 0
             if snapshot.state != s {
                 snapshot.state = s
                 publish()
             }
-        } else {
-            logWarn(.session, "keepalive lost the session — reconnecting")
-            keepaliveTask?.cancel()
-            keepaliveTask = nil
-            snapshot.sessionID = nil
-            setPhase(.disconnected)
-            await connect(preferredUDN: snapshot.camera?.udn)
+            return
         }
+
+        // A single miss means nothing. The camera stops answering for a beat
+        // right after a record command, and reacting to that by tearing down and
+        // reconnecting is what previously led to a mode switch mid-recording.
+        keepaliveFailures += 1
+        logDebug(.session, "keepalive miss \(keepaliveFailures)/\(Self.keepaliveFailureLimit)")
+        guard keepaliveFailures >= Self.keepaliveFailureLimit else { return }
+
+        // Believed-recording is the hard gate: never rebuild the session out
+        // from under an active take. Keep pinging instead.
+        if snapshot.state?.isRecording == true {
+            logWarn(.session, "session looks lost but camera is RECORDING — holding, not reconnecting")
+            return
+        }
+
+        logWarn(.session, "keepalive lost the session — reconnecting")
+        keepaliveFailures = 0
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
+        snapshot.sessionID = nil
+        setPhase(.disconnected)
+        await connect(preferredUDN: snapshot.camera?.udn)
     }
 
     // MARK: - Commands
@@ -314,6 +366,8 @@ public actor LumixSession {
         logWarn(.session, "err_critical — session expired, re-pairing")
         let newSID = try await pair(host: host, udn: snapshot.camera?.udn ?? "")
         snapshot.sessionID = newSID
+        // ensureRecordMode refuses to switch while recording or when the state
+        // is unreadable, so this is safe to call on the recovery path.
         try await ensureRecordMode(host: host, sessionID: newSID)
         publish()
         return try await transport.cgi(host: host, query: query,
