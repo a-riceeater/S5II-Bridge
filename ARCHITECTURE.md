@@ -165,6 +165,42 @@ appears (6 s cap) before returning, and `record_toggle` reads fresh state rather
 the cached keepalive sample. **Any iOS UI must do the same** — and should show a
 "stopping…" state for those ~2 s rather than pretending it's instant.
 
+## There is no live view — but there is a stream
+
+The app shows no preview and decodes no frames. It still runs `startstream`,
+because the camera will not *stay* in record mode without one:
+
+| | |
+|---|---|
+| `recmode`, keepalive only | `cammode` falls back to `play` (2 s / ~8 s) |
+| `recmode`, then `startstream` | held `cammode=rec` for 45 s+ |
+| `startstream` alone from `play` | stays in `play` — never enters `rec` |
+
+So `recmode` **enters** record mode and `startstream` **holds** it. `StreamSink`
+exists only to give the camera somewhere to send the datagrams: it binds the UDP
+port, drains it, and discards every byte at the smallest frame size (`qvga`).
+
+`StreamSink` is deliberately **not** `@MainActor` — Network framework delivers on
+its own queue, and hopping to the main actor to throw bytes away is pure waste.
+
+## `recmode` never touches the shutter path
+
+`recmode` is the command that freezes the camera. The subtle trap: a client wants
+to check `cammode` before rolling and fix it if it reads `play` — but the cached
+value is up to one keepalive old, so **it can read `play` while the camera is
+already recording**, and `recmode` then freezes the body.
+
+It is therefore sent exactly once, at connect. Drift recovery on the shutter path
+re-issues `startstream` instead, which is harmless in every state.
+
+## Releasing the camera
+
+A Lumix under remote control disables its physical buttons. That is normal, but a
+client that auto-connects makes it inescapable: freeing the camera on the body is
+instantly undone by the client re-pairing. Disconnect is therefore **sticky** —
+`userDisconnected` suppresses auto-connect on both launch and foreground until an
+explicit Connect — and surfaced as a "Release camera" button on the main screen.
+
 ## Session lifecycle
 
 ```

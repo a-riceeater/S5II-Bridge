@@ -43,11 +43,10 @@ struct SettingsView: View {
 
                 Section {
                     Toggle("Haptic feedback", isOn: $model.hapticsEnabled)
-                    Toggle("Show live view", isOn: $model.showPreview)
                 } header: {
                     Text("Behaviour")
                 } footer: {
-                    Text("The live-view stream always runs — without it the camera leaves record mode after about two seconds and the shutter stops working. This switch only controls whether the frames are decoded and displayed, and requests a larger frame size when on.")
+                    Text("A stream runs in the background at the smallest frame size and is discarded without being decoded. It is not a preview — the camera simply will not stay in record mode without one, and the shutter stops working if it lapses.")
                 }
 
                 Section {
