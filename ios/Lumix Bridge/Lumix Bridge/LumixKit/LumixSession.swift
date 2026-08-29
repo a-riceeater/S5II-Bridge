@@ -426,9 +426,14 @@ public actor LumixSession {
         logWarn(.session, "err_critical — session expired, re-pairing")
         let newSID = try await pair(host: host, udn: snapshot.camera?.udn ?? "")
         snapshot.sessionID = newSID
-        // ensureRecordMode refuses to switch while recording or when the state
-        // is unreadable, so this is safe to call on the recovery path.
-        try await ensureRecordMode(host: host, sessionID: newSID)
+        // Deliberately NOT ensureRecordMode: that would put recmode on the
+        // shutter path, and we cannot know from here whether the camera is
+        // already rolling. Re-establish the stream instead — it restores record
+        // mode when the camera is idle and is harmless when it is not.
+        if let port = streamPort {
+            await startStream(port: port)
+            try? await Task.sleep(for: .milliseconds(600))
+        }
         publish()
         return try await transport.cgi(host: host, query: query,
                                        sessionID: newSID, timeout: 8)
@@ -457,15 +462,20 @@ public actor LumixSession {
         commandInFlight = true
         defer { commandInFlight = false }
 
-        // The camera can slip back to playback on its own. Recovering via the
-        // err_critical path would mean a needless re-pair, so if the keepalive
-        // already told us we're in playback, fix that first. Safe: we are
-        // provably not recording here.
+        // The camera can slip back to playback on its own. Restore it with the
+        // STREAM, never with recmode.
+        //
+        // recmode must never appear on the shutter path. The cached cammode can
+        // be up to one keepalive old, so it may read "play" while the camera is
+        // in fact already rolling — and recmode landing on a rolling camera
+        // freezes the body. startstream is harmless in every state, so drift
+        // recovery uses only that.
         if let mode = snapshot.state?.camMode, mode != "rec",
            snapshot.state?.isRecording != true,
-           let host = snapshot.host, let sid = snapshot.sessionID {
-            logWarn(.command, "camera is in \(mode) — restoring record mode before rolling")
-            try await ensureRecordMode(host: host, sessionID: sid)
+           let port = streamPort {
+            logWarn(.command, "camera is in \(mode) — restarting stream (not recmode)")
+            await startStream(port: port)
+            try? await Task.sleep(for: .milliseconds(600))
         }
 
         let body = try await command("mode=camcmd&value=video_recstart")

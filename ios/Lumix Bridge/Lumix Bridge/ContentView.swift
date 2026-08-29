@@ -57,7 +57,7 @@ struct ContentView: View {
             model.handleScenePhase(phase)
         }
         .task {
-            if !model.phase.isReady { model.connect() }
+            if model.shouldAutoConnect { model.connect() }
         }
     }
 
@@ -198,11 +198,26 @@ private struct StatusCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if needsAction {
-                    Button("Retry") { model.reconnect() }
-                        .buttonStyle(.glassProminent)
-                        .controlSize(.small)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 8) {
+                    if needsAction {
+                        Button("Retry") { model.reconnect() }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
+                    }
+                    // "Give me my camera back": a Lumix under remote control
+                    // disables its physical buttons, so releasing needs to be
+                    // one obvious tap rather than buried in Settings.
+                    if model.phase.isReady {
+                        Button("Release camera") { model.disconnect() }
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
+                    }
+                    if model.userDisconnected {
+                        Button("Connect") { model.connect() }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
+                    }
+                    Spacer()
                 }
             }
             .padding(16)

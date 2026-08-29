@@ -181,22 +181,39 @@ final class BridgeModel {
 
     // MARK: - Connection
 
+    /// Set by an explicit Disconnect. While true, nothing auto-connects.
+    ///
+    /// This matters: a Lumix under Wi-Fi remote control disables its physical
+    /// buttons, so the body feels "frozen" until the controller lets go. With
+    /// auto-connect on launch AND on foreground, the app would re-grab the
+    /// camera the moment the user freed it — which is exactly what "I can never
+    /// seem to exit it" describes. Releasing has to be sticky.
+    private(set) var userDisconnected = false
+
+    var shouldAutoConnect: Bool { !userDisconnected && !phase.isReady }
+
     func connect() {
+        userDisconnected = false
         lastError = nil
         let udn = UserDefaults.standard.string(forKey: Keys.lastUDN)
         Task { await session?.connect(preferredUDN: udn) }
     }
 
     func reconnect() {
+        userDisconnected = false
         Task {
             await session?.reset()
             await session?.connect(preferredUDN: UserDefaults.standard.string(forKey: Keys.lastUDN))
         }
     }
 
+    /// Releases the camera and STAYS released until the user reconnects, so the
+    /// body's physical controls come back.
     func disconnect() {
+        userDisconnected = true
         teardownStream()
         Task { await session?.disconnect() }
+        logInfo(.app, "released camera — physical controls should return")
     }
 
     /// iOS suspends timers in the background, so the ~12s session always dies
@@ -204,9 +221,11 @@ final class BridgeModel {
     func handleScenePhase(_ phase: ScenePhase) {
         switch phase {
         case .active:
-            if !self.phase.isReady {
+            if shouldAutoConnect {
                 logDebug(.app, "foreground — reconnecting")
                 connect()
+            } else if userDisconnected {
+                logDebug(.app, "foreground — staying released (user disconnected)")
             }
         case .background:
             logDebug(.app, "background — session will lapse")

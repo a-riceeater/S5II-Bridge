@@ -310,7 +310,14 @@ class Lumix:
             self.log("  err_critical -> re-pairing and retrying")
             self.session_id = None
             self.pair()
-            self.ensure_rec()
+            # Deliberately NOT ensure_rec(): that would put recmode on the
+            # shutter path, and from here we cannot know whether the camera is
+            # already rolling. recmode landing on a rolling camera freezes the
+            # body. Re-establishing the stream restores record mode when the
+            # camera is idle and is harmless when it is not.
+            if self.stream_port:
+                self.start_stream(self.stream_port)
+                time.sleep(0.6)
             st, body = self.cgi(query)
         return st, body
 
@@ -380,6 +387,16 @@ class Lumix:
 
     # ---------- record ----------
     def rec_start(self):
+        # Drift recovery uses the stream only -- never recmode. The cached
+        # cammode can be a keepalive old and read "play" while the camera is in
+        # fact already rolling, and recmode then freezes the body.
+        state = self.getstate(tries=1)
+        if state.get("cammode") not in (None, "rec") and state.get("rec") != "on":
+            if self.stream_port:
+                self.log("  cammode={} -> restarting stream (not recmode)".format(
+                    state.get("cammode")))
+                self.start_stream(self.stream_port)
+                time.sleep(0.6)
         st, body = self.cmd("mode=camcmd&value=video_recstart")
         return self.result(body) == "ok", body
 

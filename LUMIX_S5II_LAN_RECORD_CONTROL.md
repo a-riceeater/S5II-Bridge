@@ -196,6 +196,34 @@ first datagrams aren't met with ICMP port-unreachable.
 > inbound UDP (0 datagrams in every run, the same block that defeated SSDP), so no
 > throughput figure here would be trustworthy.
 
+## 4b. ⚠️ `recmode` must never be on the shutter path
+
+`recmode` is the one genuinely destructive command (§5a). The trap is subtle:
+
+A client naturally wants to check `cammode` before recording and fix it if it reads
+`play`. But the cached `cammode` is up to one keepalive old, so **it can read `play`
+while the camera is already rolling** — and `recmode` landing on a rolling camera
+freezes the body. Observed exactly this way: the operator heard the camera beep
+(recording had started), the client then sent `recmode` off a stale state, and the
+camera froze.
+
+Rules:
+
+1. Send `recmode` **once, at connect**, before any recording is possible.
+2. Never send it from a record command, and never from an `err_critical` recovery —
+   at those points you cannot know whether the camera is rolling.
+3. For drift recovery use **`startstream`**, which restores record mode when the
+   camera is idle and is harmless when it is not.
+
+## 4c. Remote control disables the camera's physical buttons
+
+While a client holds a remote-shooting session the body's controls are locked — the
+camera looks "frozen" and the operator cannot exit. **This is normal**, not a fault.
+
+It becomes a real trap when the client auto-connects: releasing on the camera is
+immediately undone by the client re-pairing. Any client that auto-connects on launch
+or on foreground needs an explicit, *sticky* release that survives both.
+
 ## 5. Record start / stop
 
 ```
