@@ -231,6 +231,29 @@ Rules:
    keepalive is normal; require several consecutive misses before reconnecting,
    and never reconnect while `<rec>` is `on`.
 
+## 5bis. ⚠️ `err_busy` is a stop sign, not a retry hint
+
+`err_busy` means the camera cannot accept the command in its current state.
+**Sending anything further into that state escalates into a hard lock** — black
+screen, unresponsive physical buttons, recoverable only by removing the battery.
+Observed twice on `DC-S5M2` fw 3.61.
+
+Both times the sequence was the same: a command was rejected, the client sent
+more commands anyway, the replies degraded to a solid `err_busy` cascade, and
+the body then locked.
+
+Treat the first `err_busy` as a latched fault:
+
+1. Stop sending commands entirely — no retries, no re-pair, no mode change.
+2. Surface it to a human; the cause is usually on the body (mode dial, playback,
+   a dialog, or the camera not being in a state that allows recording).
+3. Only resume after someone has actually looked at the camera.
+
+A related trap: the camera can drift from `cammode=rec` back to `play` **on its
+own while idle**, with nothing but keepalive traffic. Confirmed by observing the
+mode flip during a 10-second idle control period with no commands sent. So
+`cammode` must be re-checked before recording rather than assumed to persist.
+
 ## 5c. Exposure settings (read + write)
 
 All confirmed round-tripping on `DC-S5M2` fw 3.61, **only while `cammode=rec`**.

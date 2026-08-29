@@ -33,6 +33,16 @@ class LumixRefused(LumixError):
     """Camera explicitly refused pairing. Never retry this -- see pair()."""
 
 
+class LumixBusy(LumixError):
+    """
+    Camera reported err_busy: it cannot accept the command in its current state.
+    Sending anything further into that state is what escalates into a hard lock
+    (black screen, battery pull) -- observed twice on DC-S5M2 fw 3.61. Once this
+    is raised the client latches a fault and refuses to send more commands until
+    a human has checked the camera.
+    """
+
+
 class Lumix:
     # The camera hex-decodes value2 and renders the result as UTF-16. Sending hex
     # of UTF-8 (what liblumix does) makes the on-screen connect prompt show CJK
@@ -51,6 +61,7 @@ class Lumix:
         self._ka_stop = threading.Event()
         self._ka_thread = None
         self._lock = threading.RLock()
+        self.faulted = None      # latched err_busy; blocks all further commands
 
     def log(self, msg):
         if self.verbose:
@@ -244,11 +255,30 @@ class Lumix:
         transition takes ~5s and the HTTP server is unresponsive during part of
         it, so poll tolerantly. No-op if already in rec mode.
         """
-        if self.cammode(tries=3) == "rec":
+        if self.faulted:
+            raise LumixBusy("blocked: camera reported {}".format(self.faulted))
+
+        state = self.getstate(tries=3)
+        if state.get("rec") == "on":
+            # Recording implies record mode. Switching now would lock the body.
+            self.log("  camera is RECORDING -- not touching mode")
             return 0.0
+        if not state:
+            raise LumixError("could not read camera state; refusing to change "
+                             "mode blindly")
+        if state.get("cammode") == "rec":
+            return 0.0
+
         t = time.time()
         try:
-            self.cgi("mode=camcmd&value=recmode", timeout=12)
+            st, body = self.cgi("mode=camcmd&value=recmode", timeout=12)
+            r = self.result(body)
+            if r in ("err_busy", "err_critical"):
+                self.faulted = r
+                raise LumixBusy("camera refused to switch to record mode ({}); "
+                                "check the mode dial and the camera screen".format(r))
+        except LumixBusy:
+            raise
         except Exception:
             pass                                   # expected during the switch
         while time.time() - t < timeout_s:
@@ -258,8 +288,25 @@ class Lumix:
         raise LumixError("camera did not enter rec mode within {}s".format(timeout_s))
 
     def cmd(self, query, recover=True):
-        """cam.cgi call with automatic session recovery."""
+        """
+        cam.cgi call with automatic session recovery.
+
+        CIRCUIT BREAKER: the first err_busy latches a fault and every later
+        command is refused locally. Nothing is retried and no mode change is
+        attempted -- pushing commands into a busy camera is what locks it up.
+        Call clear_fault() once the body has been checked.
+        """
+        if self.faulted:
+            raise LumixBusy("blocked: camera reported {} and is not accepting "
+                            "commands; check the body, then clear_fault()"
+                            .format(self.faulted))
         st, body = self.cgi(query)
+
+        if self.result(body) == "err_busy":
+            self.faulted = "err_busy"
+            self.log("  err_busy -> LATCHING FAULT, no further commands will be sent")
+            raise LumixBusy("camera reported err_busy on: {}".format(query))
+
         if recover and self.result(body) == "err_critical":
             self.log("  err_critical -> re-pairing and retrying")
             self.session_id = None
@@ -286,6 +333,10 @@ class Lumix:
         self._ka_stop.clear()
         self._ka_thread = threading.Thread(target=loop, daemon=True)
         self._ka_thread.start()
+
+    def clear_fault(self):
+        """Explicitly clear a latched err_busy after checking the camera."""
+        self.faulted = None
 
     def stop_keepalive(self):
         self._ka_stop.set()

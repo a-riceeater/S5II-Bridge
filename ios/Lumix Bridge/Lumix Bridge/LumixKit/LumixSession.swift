@@ -70,6 +70,9 @@ public actor LumixSession {
     private var keepaliveTask: Task<Void, Never>?
     private var commandInFlight = false
     private var keepaliveFailures = 0
+    /// Latched when the camera rejects a command as busy. Blocks all further
+    /// commands until a human clears it. See command().
+    private var faulted: String?
 
     private let onChange: @Sendable (SessionSnapshot) -> Void
 
@@ -150,8 +153,16 @@ public actor LumixSession {
         logInfo(.session, "disconnected")
     }
 
+    public func clearFault() {
+        faulted = nil
+        logInfo(.session, "fault cleared by user")
+    }
+
+    public func isFaulted() -> Bool { faulted != nil }
+
     /// Clears a `refused`/`failed` phase so the user can retry after re-arming.
     public func reset() {
+        faulted = nil
         keepaliveTask?.cancel()
         keepaliveTask = nil
         snapshot = SessionSnapshot()
@@ -240,6 +251,9 @@ public actor LumixSession {
     /// `cammode=play` + `rec=off`. An unreadable state is treated as "do not
     /// touch", never as "probably in playback".
     private func ensureRecordMode(host: String, sessionID: String) async throws {
+        if let fault = faulted {
+            throw LumixError.cameraError("blocked: camera reported \(fault)")
+        }
         // Read state with retries: the camera is briefly unresponsive right
         // after a record command, and a single nil here must not be mistaken
         // for "in playback".
@@ -272,8 +286,20 @@ public actor LumixSession {
         logInfo(.session, "camera is in playback — switching to record (~5s)")
         setPhase(.connecting, "Switching camera to record mode…")
 
-        _ = try? await transport.cgi(host: host, query: "mode=camcmd&value=recmode",
-                                     sessionID: sessionID, timeout: 12, category: .command)
+        if let body = try? await transport.cgi(host: host, query: "mode=camcmd&value=recmode",
+                                               sessionID: sessionID, timeout: 12,
+                                               category: .command) {
+            let r = CamCGI.result(body)
+            if r == "err_busy" || r == "err_critical" {
+                // The camera is refusing the mode change. Pushing further is
+                // exactly the path that ends in a hard lock.
+                faulted = r
+                logError(.command, "recmode rejected (\(r ?? "?")) — LATCHING FAULT")
+                throw LumixError.cameraError(
+                    "camera refused to switch to record mode (\(r ?? "?")). "
+                    + "Check the mode dial and the camera screen.")
+            }
+        }
 
         let deadline = Date().addingTimeInterval(Self.recModeTimeout)
         while Date() < deadline {
@@ -354,13 +380,35 @@ public actor LumixSession {
     // MARK: - Commands
 
     /// Sends a command, transparently re-pairing once if the session lapsed.
+    ///
+    /// CIRCUIT BREAKER: `err_busy` means the camera cannot accept the command in
+    /// its current state. Sending anything further into that state is what
+    /// escalates into a hard lock (black screen, battery pull) — observed twice.
+    /// So the first `err_busy` latches a fault and every subsequent command is
+    /// refused locally until a human clears it. Nothing is retried, nothing is
+    /// re-paired, and no mode change is attempted.
     @discardableResult
     private func command(_ query: String) async throws -> String {
+        if let fault = faulted {
+            throw LumixError.cameraError(
+                "blocked: camera reported \(fault) and is not accepting commands. "
+                + "Check the body, then clear the fault to resume.")
+        }
         guard let host = snapshot.host, let sid = snapshot.sessionID else {
             throw LumixError.notReady(snapshot.phase.label)
         }
         let body = try await transport.cgi(host: host, query: query,
                                            sessionID: sid, timeout: 8)
+
+        if CamCGI.result(body) == "err_busy" {
+            faulted = "err_busy"
+            setPhase(.failed("Camera busy"),
+                     "The camera rejected a command as busy. Further commands are blocked to avoid locking it up — check the camera body, then tap Retry.")
+            logError(.command, "err_busy — LATCHING FAULT, no further commands will be sent",
+                     detail: query)
+            throw LumixError.cameraError("err_busy")
+        }
+
         guard CamCGI.result(body) == "err_critical" else { return body }
 
         logWarn(.session, "err_critical — session expired, re-pairing")
@@ -452,6 +500,9 @@ public actor LumixSession {
 
     /// Settings are unreadable in playback and must never be touched mid-take.
     private func requireSettingsAccess() throws -> (host: String, sid: String) {
+        if let fault = faulted {
+            throw LumixError.cameraError("blocked: camera reported \(fault)")
+        }
         guard snapshot.phase.isReady,
               let host = snapshot.host,
               let sid = snapshot.sessionID else {
