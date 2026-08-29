@@ -27,12 +27,12 @@ This maps 1:1 onto the planned iOS app: LumixBridge becomes a long-lived object
 owned by the app, the HTTP layer is replaced by the UI/Shortcuts layer, and the
 threading here becomes a serial DispatchQueue or an actor. See ARCHITECTURE.md.
 """
-import argparse, json, os, sys, threading, time
+import argparse, json, os, socket, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import discover
-from lumix import Lumix, LumixError, LumixRefused, KEEPALIVE_INTERVAL
+from lumix import Lumix, LumixError, LumixRefused, LumixBusy, KEEPALIVE_INTERVAL
 
 
 class BridgeState(object):
@@ -41,6 +41,7 @@ class BridgeState(object):
     CONNECTING = "connecting"
     READY = "ready"
     REFUSED = "refused"          # terminal until a human re-arms the camera
+    FAULTED = "faulted"          # terminal: camera reported err_busy
 
 
 class LumixBridge(object):
@@ -59,6 +60,9 @@ class LumixBridge(object):
         self.verbose = verbose
 
         self.cam = None
+        self.stream_sock = None
+        self.stream_thread = None
+        self.stream_stop = threading.Event()
         self.state = BridgeState.DISCONNECTED
         self.detail = ""
         self.last_state = {}
@@ -86,6 +90,12 @@ class LumixBridge(object):
         self._teardown()
 
     def _teardown(self):
+        try:
+            if self.cam:
+                self.cam.stop_stream()
+        except Exception:
+            pass
+        self._stop_stream()
         """
         Leave the camera as tidily as we can. There is no documented 'release
         session' verb, so the best available exit is to stop recording if we
@@ -130,10 +140,24 @@ class LumixBridge(object):
             self.last_error = str(e)
             self.log("REFUSED -- not retrying. {}".format(e))
             return False
+        except LumixBusy as e:
+            # Terminal too. The per-connection breaker inside Lumix does not
+            # survive here because _connect() builds a fresh client each time,
+            # so the supervisor would happily retry err_busy forever -- which is
+            # exactly the cascade that locks the body. Latch it at this level.
+            self.state = BridgeState.FAULTED
+            self.last_error = str(e)
+            self.log("FAULTED -- not retrying. {}".format(e))
+            return False
         except LumixError as e:
             self.last_error = str(e)
             self.log("connect failed: {}".format(e))
             return False
+
+        # The live-view stream is what holds cammode=rec; without it the camera
+        # falls back to playback after ~2s and the shutter stops working. We
+        # bind and drain the socket but never decode the frames.
+        self._start_stream(cam)
 
         with self._lock:
             self.cam = cam
@@ -143,11 +167,48 @@ class LumixBridge(object):
         self.log("READY (session {})".format(cam.session_id))
         return True
 
+    def _start_stream(self, cam, port=49199):
+        self._stop_stream()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", port))
+            sock.settimeout(1.0)
+        except Exception as e:
+            self.log("could not bind udp/{}: {}".format(port, e))
+            return
+        self.stream_sock = sock
+        self.stream_stop.clear()
+
+        def drain():
+            while not self.stream_stop.is_set():
+                try:
+                    sock.recvfrom(65535)      # discarded; we only need a receiver
+                except Exception:
+                    pass
+
+        self.stream_thread = threading.Thread(target=drain, daemon=True)
+        self.stream_thread.start()
+        cam.set_liveview_size("qvga")         # smallest, since we never show it
+        cam.start_stream(port)
+
+    def _stop_stream(self):
+        self.stream_stop.set()
+        if self.stream_thread:
+            self.stream_thread.join(timeout=2)
+            self.stream_thread = None
+        if self.stream_sock:
+            try:
+                self.stream_sock.close()
+            except Exception:
+                pass
+            self.stream_sock = None
+
     # ---------- supervisor ----------
     def _run(self):
         backoff = 2.0
         while not self._stop.is_set():
-            if self.state == BridgeState.REFUSED:
+            if self.state in (BridgeState.REFUSED, BridgeState.FAULTED):
                 self._stop.wait(5)          # wait for an explicit /reconnect
                 continue
 
@@ -166,6 +227,14 @@ class LumixBridge(object):
                     st = self.cam.getstate(timeout=4)
                 if st:
                     self.last_state = st
+                    # Record mode lapses ~2s after the stream stops. Re-issuing
+                    # startstream restores it and is safe; recmode is NOT (it
+                    # locks the body if it lands while recording).
+                    if st.get("cammode") != "rec" and st.get("rec") != "on":
+                        self.log("cammode={} -- restarting stream to hold record mode"
+                                 .format(st.get("cammode")))
+                        with self._lock:
+                            self.cam.start_stream(self.cam.stream_port or 49199)
                 else:
                     raise LumixError("keepalive got no state")
             except Exception as e:

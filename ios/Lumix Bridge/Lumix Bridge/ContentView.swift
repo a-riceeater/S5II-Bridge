@@ -18,8 +18,9 @@ struct ContentView: View {
         NavigationStack {
             ZStack {
                 backdrop
-                VStack(spacing: 28) {
+                VStack(spacing: 22) {
                     StatusCard(namespace: glass)
+                    if model.showPreview { PreviewPane() }
                     Spacer(minLength: 0)
                     RecordButton()
                     Spacer(minLength: 0)
@@ -71,6 +72,43 @@ struct ContentView: View {
         )
         .ignoresSafeArea()
         .animation(.smooth(duration: 0.45), value: model.isRecording)
+    }
+}
+
+// MARK: - Live-view preview
+
+/// The stream runs regardless — it is what holds the camera in record mode.
+/// This only shows the frames we are already receiving.
+private struct PreviewPane: View {
+    @Environment(BridgeModel.self) private var model
+
+    var body: some View {
+        ZStack {
+            #if canImport(UIKit)
+            if let img = model.liveView.image {
+                Image(uiImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                placeholder
+            }
+            #else
+            placeholder
+            #endif
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 200)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private var placeholder: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "video.slash").font(.title3)
+            Text(model.liveView.isRunning ? "Waiting for frames…" : "Stream not running")
+                .font(.caption)
+        }
+        .foregroundStyle(.secondary)
     }
 }
 

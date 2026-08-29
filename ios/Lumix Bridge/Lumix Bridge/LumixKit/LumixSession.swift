@@ -114,6 +114,16 @@ public actor LumixSession {
     public func connect(preferredUDN: String? = nil) async {
         guard snapshot.phase != .searching, snapshot.phase != .connecting else { return }
 
+        // A latched fault must survive reconnect attempts, otherwise a
+        // supervisor loop retries err_busy forever — which is the cascade that
+        // locks the camera. Only clearFault()/reset() may lift this.
+        if let fault = faulted {
+            setPhase(.failed("Camera busy"),
+                     "The camera reported \(fault) and is not accepting commands. "
+                     + "Check the camera body, then tap Retry.")
+            return
+        }
+
         setPhase(.searching)
         guard let found = await discovery.find(udn: preferredUDN) else {
             setPhase(.failed("No camera found"),
@@ -286,20 +296,14 @@ public actor LumixSession {
         logInfo(.session, "camera is in playback — switching to record (~5s)")
         setPhase(.connecting, "Switching camera to record mode…")
 
-        if let body = try? await transport.cgi(host: host, query: "mode=camcmd&value=recmode",
-                                               sessionID: sessionID, timeout: 12,
-                                               category: .command) {
-            let r = CamCGI.result(body)
-            if r == "err_busy" || r == "err_critical" {
-                // The camera is refusing the mode change. Pushing further is
-                // exactly the path that ends in a hard lock.
-                faulted = r
-                logError(.command, "recmode rejected (\(r ?? "?")) — LATCHING FAULT")
-                throw LumixError.cameraError(
-                    "camera refused to switch to record mode (\(r ?? "?")). "
-                    + "Check the mode dial and the camera screen.")
-            }
-        }
+        // The reply code from recmode is NOT trustworthy: it frequently returns
+        // err_critical while the switch actually succeeds (confirmed — cammode
+        // read "rec" two seconds after an err_critical reply). So the result is
+        // deliberately ignored and only the observed state is believed. Failing
+        // on the reply code here is what stopped the client connecting at all.
+        _ = try? await transport.cgi(host: host, query: "mode=camcmd&value=recmode",
+                                     sessionID: sessionID, timeout: 12,
+                                     category: .command)
 
         let deadline = Date().addingTimeInterval(Self.recModeTimeout)
         while Date() < deadline {
@@ -350,6 +354,14 @@ public actor LumixSession {
             if snapshot.state != s {
                 snapshot.state = s
                 publish()
+            }
+            // The camera drops out of record mode ~2s after the stream stops.
+            // Re-issuing startstream restores it and is safe; recmode is NOT
+            // (it locks the body if it lands while recording), so only the
+            // stream is used for this recovery.
+            if s.camMode != "rec", !s.isRecording, let port = streamPort {
+                logWarn(.session, "cammode=\(s.camMode) — restarting stream to hold record mode")
+                await startStream(port: port)
             }
             return
         }
@@ -487,6 +499,48 @@ public actor LumixSession {
         } else {
             try await startRecording()
         }
+    }
+
+    // MARK: - Live-view stream (required to hold record mode)
+    //
+    // Measured: with keepalive alone the camera leaves cammode=rec after ~2s and
+    // video_recstart then fails. With startstream running it holds indefinitely.
+    // So this is part of the shutter path, not a preview feature.
+
+    private var streamPort: UInt16?
+
+    @discardableResult
+    public func startStream(port: UInt16) async -> Bool {
+        guard let host = snapshot.host, let sid = snapshot.sessionID,
+              faulted == nil else { return false }
+        guard let body = try? await transport.cgi(
+            host: host, query: "mode=startstream&value=\(port)",
+            sessionID: sid, timeout: 8, category: .session),
+              CamCGI.isOK(body) else {
+            logWarn(.session, "startstream failed — record mode will lapse in ~2s")
+            return false
+        }
+        streamPort = port
+        logInfo(.session, "stream started on udp/\(port) — holding record mode")
+        return true
+    }
+
+    public func stopStream() async {
+        guard let host = snapshot.host, let sid = snapshot.sessionID,
+              streamPort != nil else { return }
+        _ = try? await transport.cgi(host: host, query: "mode=stopstream",
+                                     sessionID: sid, timeout: 6, category: .session)
+        streamPort = nil
+        logInfo(.session, "stream stopped")
+    }
+
+    public func setLiveViewSize(_ size: LiveViewSize) async {
+        guard let host = snapshot.host, let sid = snapshot.sessionID,
+              faulted == nil else { return }
+        _ = try? await transport.cgi(
+            host: host, query: "mode=setsetting&type=liveviewsize&value=\(size.rawValue)",
+            sessionID: sid, timeout: 6, category: .session)
+        logInfo(.session, "liveviewsize = \(size.rawValue)")
     }
 
     // MARK: - Exposure settings

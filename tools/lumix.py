@@ -62,6 +62,7 @@ class Lumix:
         self._ka_thread = None
         self._lock = threading.RLock()
         self.faulted = None      # latched err_busy; blocks all further commands
+        self.stream_port = None  # live-view stream holds cammode=rec
 
     def log(self, msg):
         if self.verbose:
@@ -269,16 +270,14 @@ class Lumix:
         if state.get("cammode") == "rec":
             return 0.0
 
+        # The reply code from recmode is NOT trustworthy: it frequently returns
+        # err_critical while the switch actually succeeds (confirmed -- cammode
+        # read "rec" two seconds after an err_critical reply). Ignore the result
+        # and believe only the observed state. Failing on the reply code here is
+        # what stopped the client connecting at all.
         t = time.time()
         try:
-            st, body = self.cgi("mode=camcmd&value=recmode", timeout=12)
-            r = self.result(body)
-            if r in ("err_busy", "err_critical"):
-                self.faulted = r
-                raise LumixBusy("camera refused to switch to record mode ({}); "
-                                "check the mode dial and the camera screen".format(r))
-        except LumixBusy:
-            raise
+            self.cgi("mode=camcmd&value=recmode", timeout=12)
         except Exception:
             pass                                   # expected during the switch
         while time.time() - t < timeout_s:
@@ -333,6 +332,41 @@ class Lumix:
         self._ka_stop.clear()
         self._ka_thread = threading.Thread(target=loop, daemon=True)
         self._ka_thread.start()
+
+    # ---------- live-view stream ----------
+    # REQUIRED, not optional. Measured on DC-S5M2 fw 3.61: with keepalive alone
+    # the camera leaves cammode=rec after ~2s and video_recstart then fails with
+    # err_critical. With startstream running it holds indefinitely. Bind the UDP
+    # socket BEFORE calling this so the camera is not answered with ICMP
+    # port-unreachable.
+
+    def start_stream(self, port=49199):
+        st, body = self.cgi("mode=startstream&value={}".format(port), timeout=8)
+        ok = self.result(body) == "ok"
+        if ok:
+            self.stream_port = port
+            self.log("  stream started on udp/{} -- holding record mode".format(port))
+        else:
+            self.log("  startstream FAILED -- record mode will lapse in ~2s")
+        return ok
+
+    def stop_stream(self):
+        if not getattr(self, "stream_port", None):
+            return
+        try:
+            self.cgi("mode=stopstream", timeout=6)
+        except Exception:
+            pass
+        self.stream_port = None
+
+    def set_liveview_size(self, size="qvga"):
+        """qvga is the smallest; we do not decode the frames in the CLI bridge."""
+        try:
+            st, body = self.cgi(
+                "mode=setsetting&type=liveviewsize&value={}".format(size), timeout=6)
+            return self.result(body) == "ok"
+        except Exception:
+            return False
 
     def clear_fault(self):
         """Explicitly clear a latched err_busy after checking the camera."""

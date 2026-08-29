@@ -11,9 +11,12 @@ Reverse-engineered against a real body. Target: a low-bandwidth remote shutter w
 | IP under test | `10.0.0.177` (DHCP, same /24 as client) |
 | Protocol | Plain HTTP `GET` to `/cam.cgi`, XML replies. No TLS, no auth beyond a session token. |
 
-**Headline result: live view is completely avoidable.** Recording was driven start-to-finish
-without ever calling `startstream`. Steady-state cost is one ~400-byte keepalive every few
-seconds plus ~200 bytes per command — versus the multi-Mbit/s MJPEG stream Lumix Sync opens.
+> **Correction.** An earlier version of this document claimed live view was completely
+> avoidable. **That was wrong.** Recording *commands* need no stream, but the camera does
+> not *stay* in record mode without one: with keepalive alone `cammode` falls back to
+> `play` (2s in one measurement, ~8s in another) and `video_recstart` then fails. A/B
+> measured — see §4a. Plan on running `startstream`; you can request the smallest frame
+> size and never decode it, but you cannot skip it.
 
 ---
 
@@ -145,6 +148,54 @@ This transition takes **~5 s**, and the HTTP server stops answering for part of 
 timeouts and poll `getstate` tolerantly until `<cammode>rec</cammode>`. This ~5 s is the
 single largest latency in the whole system, and it is paid **once per session**, not per take.
 
+## 4a. Record mode is not self-sustaining
+
+Two separate facts, both measured on `DC-S5M2` fw 3.61:
+
+**`recmode` enters record mode. `startstream` keeps it there.**
+
+| | |
+|---|---|
+| `startstream` alone, from `play` | **stays in `play`** — 12s observed, never enters `rec` |
+| `recmode`, then keepalive only | drifts back to `play` (2s in one run, ~8s in another) |
+| `recmode`, then `startstream` | **held `rec` for 45s+** |
+
+So the working order is:
+
+```
+pair  ->  recmode (enter)  ->  startstream (hold, within ~2s)
+```
+
+A client that skips the stream will appear to work — right up until the first pause
+between takes, when `video_recstart` starts returning `err_critical`.
+
+Recovery from a drift should re-issue **`startstream`**, never `recmode`: the stream is
+harmless, whereas `recmode` landing during a recording locks the body (§5a).
+
+### `recmode`'s reply code is unreliable
+
+`mode=camcmd&value=recmode` frequently returns `err_critical` **while still succeeding**:
+
+```
+recmode -> err_critical
+t+2s     cammode=rec      <- it worked
+t+8s     cammode=rec
+```
+
+Ignore the result and poll `getstate` for `cammode=rec` instead. Treating that
+`err_critical` as a failure will stop a client connecting at all.
+
+### Reducing the cost
+
+`liveviewsize` is readable and writable (`qvga`, `vga`, `low`, `standard`, `fine`).
+Set it to `qvga` and simply never decode the datagrams — the camera only needs a live
+receiver, not an attentive one. Bind the UDP port **before** calling `startstream` so the
+first datagrams aren't met with ICMP port-unreachable.
+
+> Actual stream bandwidth was **not measured**: the test host's firewall blocked all
+> inbound UDP (0 datagrams in every run, the same block that defeated SSDP), so no
+> throughput figure here would be trustworthy.
+
 ## 5. Record start / stop
 
 ```
@@ -232,6 +283,11 @@ Rules:
    and never reconnect while `<rec>` is `on`.
 
 ## 5bis. ⚠️ `err_busy` is a stop sign, not a retry hint
+
+`err_busy` is a **persistent camera state, not a transient one**. Once in it the camera
+still answers `getstate` normally and still reports `cammode=rec`, while rejecting
+*every* command — `video_recstart`, `video_recstop` and even `startstream`. Nothing the
+client sends clears it; the body needs attention.
 
 `err_busy` means the camera cannot accept the command in its current state.
 **Sending anything further into that state escalates into a hard lock** — black

@@ -77,6 +77,7 @@ final class BridgeModel {
         static let clientName = "clientName"
         static let nameEncoding = "nameEncoding"
         static let haptics = "hapticsEnabled"
+        static let showPreview = "showPreview"
         static let lastHost = "lastHost"
         static let lastUDN = "lastUDN"
     }
@@ -91,6 +92,7 @@ final class BridgeModel {
         self.nameEncoding = PairingCodec.NameEncoding(
             rawValue: defaults.string(forKey: Keys.nameEncoding) ?? "") ?? .utf16LE
         self.hapticsEnabled = defaults.object(forKey: Keys.haptics) as? Bool ?? true
+        self.showPreview = defaults.object(forKey: Keys.showPreview) as? Bool ?? false
 
         // [weak self] must be on the OUTER closure: putting it only on the inner
         // Task would still capture self strongly here, during init.
@@ -106,9 +108,61 @@ final class BridgeModel {
         logInfo(.app, "Lumix Bridge started")
     }
 
+    // MARK: - Live view
+    //
+    // Not a preview feature: without `startstream` the camera leaves record mode
+    // after ~2s and the shutter stops working. The socket therefore runs whenever
+    // we're connected. Decoding is what the toggle actually controls.
+
+    let liveView = LumixLiveView()
+    private var streamStarted = false
+
+    var showPreview: Bool {
+        didSet {
+            UserDefaults.standard.set(showPreview, forKey: Keys.showPreview)
+            liveView.decodeFrames = showPreview
+            Task { await session?.setLiveViewSize(showPreview ? .vga : .qvga) }
+        }
+    }
+
+    /// Brings up the UDP socket first, then asks the camera to stream to it, so
+    /// the first datagrams aren't answered with ICMP port-unreachable.
+    private func startStreamIfNeeded() {
+        guard !streamStarted, phase.isReady else { return }
+        streamStarted = true
+        Task {
+            do {
+                try liveView.start()
+            } catch {
+                logError(.session, "live-view socket failed", detail: error.localizedDescription)
+            }
+            liveView.decodeFrames = showPreview
+            let ok = await session?.startStream(port: liveView.port) ?? false
+            if !ok {
+                streamStarted = false
+                logWarn(.session, "stream did not start — record mode will keep lapsing")
+            } else {
+                await session?.setLiveViewSize(showPreview ? .vga : .qvga)
+            }
+        }
+    }
+
+    private func teardownStream() {
+        guard streamStarted else { return }
+        streamStarted = false
+        Task {
+            await session?.stopStream()
+            liveView.stop()
+        }
+    }
+
     private func apply(_ snap: SessionSnapshot) {
         let wasRecording = snapshot.state?.isRecording
+        let wasReady = snapshot.phase.isReady
         snapshot = snap
+
+        if snap.phase.isReady && !wasReady { startStreamIfNeeded() }
+        if !snap.phase.isReady && wasReady { teardownStream() }
 
         // Drop the optimistic override as soon as the camera confirms it.
         if let optimistic = optimisticRecording,
@@ -141,6 +195,7 @@ final class BridgeModel {
     }
 
     func disconnect() {
+        teardownStream()
         Task { await session?.disconnect() }
     }
 
